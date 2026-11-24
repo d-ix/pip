@@ -1,0 +1,177 @@
+import logging
+import random
+import sqlite3
+from datetime import datetime
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters
+)
+
+TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА"
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+log = logging.getLogger(__name__)
+
+# ---------- База данных ----------
+conn = sqlite3.connect("bot.db", check_same_thread=False)
+cur = conn.cursor()
+cur.execute("""
+CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    text TEXT,
+    created TEXT
+)
+""")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    joined TEXT
+)
+""")
+conn.commit()
+
+
+def save_user(user):
+    cur.execute(
+        "INSERT OR IGNORE INTO users (user_id, username, joined) VALUES (?, ?, ?)",
+        (user.id, user.username or "", datetime.now().isoformat())
+    )
+    conn.commit()
+
+
+# ---------- Команды ----------
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_user(user)
+    kb = [
+        [InlineKeyboardButton("🎲 Рандом", callback_data="random")],
+        [InlineKeyboardButton("🕐 Время", callback_data="time")],
+        [InlineKeyboardButton("📝 Мои заметки", callback_data="notes")],
+    ]
+    await update.message.reply_text(
+        f"Привет, {user.first_name}!\n"
+        f"Я бот-мультитул. Жми кнопки или пиши команды:\n\n"
+        f"/note <текст> — сохранить заметку\n"
+        f"/notes — показать заметки\n"
+        f"/del <id> — удалить заметку\n"
+        f"/roll — кубик\n"
+        f"/coin — монетка\n"
+        f"/stats — статистика",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+
+async def note(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_user(user)
+    text = " ".join(ctx.args)
+    if not text:
+        await update.message.reply_text("Напиши: /note купить хлеб")
+        return
+    cur.execute(
+        "INSERT INTO notes (user_id, text, created) VALUES (?, ?, ?)",
+        (user.id, text, datetime.now().isoformat())
+    )
+    conn.commit()
+    await update.message.reply_text(f"✅ Записал: {text}")
+
+
+async def notes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    rows = cur.execute(
+        "SELECT id, text FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 20",
+        (user.id,)
+    ).fetchall()
+    if not rows:
+        await update.message.reply_text("Заметок нет. Добавь: /note текст")
+        return
+    out = "\n".join(f"#{i} — {t}" for i, t in rows)
+    await update.message.reply_text(f"📝 Твои заметки:\n\n{out}")
+
+
+async def delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not ctx.args:
+        await update.message.reply_text("Напиши: /del 3")
+        return
+    try:
+        nid = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом")
+        return
+    cur.execute("DELETE FROM notes WHERE id = ? AND user_id = ?", (nid, user.id))
+    conn.commit()
+    await update.message.reply_text(f"🗑 Удалено (если было твоё)")
+
+
+async def roll(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"🎲 Выпало: {random.randint(1, 6)}")
+
+
+async def coin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(random.choice(["🪙 Орёл", "🪙 Решка"]))
+
+
+async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    total_users = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    total_notes = cur.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    my_notes = cur.execute(
+        "SELECT COUNT(*) FROM notes WHERE user_id = ?", (update.effective_user.id,)
+    ).fetchone()[0]
+    await update.message.reply_text(
+        f"📊 Статистика:\n"
+        f"Пользователей: {total_users}\n"
+        f"Всего заметок: {total_notes}\n"
+        f"Твоих заметок: {my_notes}"
+    )
+
+
+# ---------- Кнопки ----------
+async def buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "random":
+        await q.edit_message_text(f"🎯 Случайное число: {random.randint(1, 1000)}")
+    elif q.data == "time":
+        await q.edit_message_text(f"🕐 Сейчас: {datetime.now().strftime('%H:%M:%S %d.%m.%Y')}")
+    elif q.data == "notes":
+        rows = cur.execute(
+            "SELECT id, text FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 10",
+            (q.from_user.id,)
+        ).fetchall()
+        if not rows:
+            await q.edit_message_text("Заметок нет")
+        else:
+            out = "\n".join(f"#{i} — {t}" for i, t in rows)
+            await q.edit_message_text(f"📝 Заметки:\n\n{out}")
+
+
+async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Не понял. Жми /start")
+
+
+# ---------- Запуск ----------
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("note", note))
+    app.add_handler(CommandHandler("notes", notes))
+    app.add_handler(CommandHandler("del", delete))
+    app.add_handler(CommandHandler("roll", roll))
+    app.add_handler(CommandHandler("coin", coin))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CallbackQueryHandler(buttons))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown))
+    log.info("Бот запущен")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
